@@ -1,0 +1,9 @@
+version: "3.9"
+
+services:
+  weather-proxy:
+    build: .
+    container_name: meshtastic-weather-proxy
+    ports:
+      - "80:80"
+    restart: unless-stopped
