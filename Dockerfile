@@ -8,7 +8,7 @@ WORKDIR /app
 COPY prox.py .
 
 # Port, auf dem der Server läuft
-EXPOSE 80
+EXPOSE 8080
 
 # Container-Startbefehl
 CMD ["python3", "prox.py"]

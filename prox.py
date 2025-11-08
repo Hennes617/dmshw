@@ -405,7 +405,7 @@ class WeatherProxyHandler(BaseHTTPRequestHandler):
         print(f"[{self.log_date_time_string()}] {format % args}")
 
 def main():
-    PORT = 80
+    PORT = 8080
     server = HTTPServer(('localhost', PORT), WeatherProxyHandler)
     
     print(f"""
