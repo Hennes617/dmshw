@@ -5,7 +5,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # Nur die Python-Datei kopieren
-COPY prox.py .
+COPY app/prox.py .
 
 # Port, auf dem der Server läuft
 EXPOSE 80
