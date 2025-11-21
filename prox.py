@@ -456,7 +456,7 @@ class WeatherProxyHandler(BaseHTTPRequestHandler):
 
 def main():
     PORT = 80
-    server = HTTPServer(('localhost', PORT), WeatherProxyHandler)
+    server = HTTPServer(('0.0.0.0', PORT), WeatherProxyHandler)
     
     print(f"""
     ╔═══════════════════════════════════════════════════════════╗
