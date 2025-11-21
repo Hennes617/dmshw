@@ -2,6 +2,7 @@
 """
 Lokaler Proxy-Server für Meshtastic Wetterdaten
 Umgeht CORS-Beschränkungen durch lokalen Server
+Mit 5-Minuten-Cache für API-Anfragen
 """
 
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -9,6 +10,15 @@ import json
 import urllib.request
 import urllib.parse
 from math import radians, sin, cos, sqrt, atan2
+from time import time
+
+# Cache-Speicher (global für alle Requests)
+cache = {
+    'data': None,
+    'timestamp': 0
+}
+
+CACHE_DURATION = 300  # 5 Minuten in Sekunden
 
 class WeatherProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -20,20 +30,40 @@ class WeatherProxyHandler(BaseHTTPRequestHandler):
             self.send_error(404)
     
     def proxy_nodes(self):
-        """Leitet die Anfrage an die API weiter und gibt die Daten zurück"""
+        """Leitet die Anfrage an die API weiter und gibt die Daten zurück (mit Cache)"""
+        global cache
+        
         try:
-            # Daten von der API abrufen
-            with urllib.request.urlopen('https://dmshw.vanix.cloud/nodes') as response:
-                data = response.read()
+            current_time = time()
+            cache_age = current_time - cache['timestamp']
+            
+            # Prüfe ob Cache gültig ist
+            if cache['data'] is not None and cache_age < CACHE_DURATION:
+                # Cache ist noch gültig
+                print(f"✓ Cache verwendet (noch {int(CACHE_DURATION - cache_age)}s gültig)")
+                data = cache['data']
+            else:
+                # Cache ist abgelaufen oder leer, neue Daten abrufen
+                print("↻ Neue Daten von API abrufen...")
+                with urllib.request.urlopen('https://dmshw.vanix.cloud/nodes') as response:
+                    data = response.read()
+                
+                # Im Cache speichern
+                cache['data'] = data
+                cache['timestamp'] = current_time
+                print(f"✓ Daten gecached für {CACHE_DURATION}s")
             
             # Antwort mit CORS-Headern senden
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('X-Cache-Status', 
+                           'HIT' if cache_age < CACHE_DURATION else 'MISS')
             self.end_headers()
             self.wfile.write(data)
             
         except Exception as e:
+            print(f"✗ Fehler: {e}")
             self.send_error(500, str(e))
     
     def serve_html(self):
@@ -189,6 +219,14 @@ class WeatherProxyHandler(BaseHTTPRequestHandler):
             font-size: 0.85em;
         }
         
+        .cache-status {
+            text-align: center;
+            color: #28a745;
+            margin-top: 10px;
+            font-size: 0.8em;
+            font-weight: 500;
+        }
+        
         .error {
             background: #fee;
             color: #c33;
@@ -265,6 +303,7 @@ class WeatherProxyHandler(BaseHTTPRequestHandler):
             </div>
             
             <div class="update-time" id="updateTime"></div>
+            <div class="cache-status" id="cacheStatus"></div>
             
             <button class="refresh-btn" onclick="loadWeatherData()">
                 🔄 Aktualisieren
@@ -349,6 +388,17 @@ class WeatherProxyHandler(BaseHTTPRequestHandler):
                     throw new Error('Fehler beim Abrufen der Daten');
                 }
                 
+                // Cache-Status aus Header auslesen
+                const cacheStatus = response.headers.get('X-Cache-Status');
+                const cacheStatusEl = document.getElementById('cacheStatus');
+                if (cacheStatus === 'HIT') {
+                    cacheStatusEl.textContent = '⚡ Daten aus Cache (schnell!)';
+                    cacheStatusEl.style.color = '#28a745';
+                } else {
+                    cacheStatusEl.textContent = '🌐 Neue Daten von API geladen';
+                    cacheStatusEl.style.color = '#667eea';
+                }
+                
                 const nodes = await response.json();
                 console.log(`${nodes.length} Nodes gefunden`);
                 
@@ -411,10 +461,12 @@ def main():
     print(f"""
     ╔═══════════════════════════════════════════════════════════╗
     ║         Meshtastic Wetter-Proxy Server                     ║
+    ║                   MIT 5-MINUTEN-CACHE                      ║
     ╠═══════════════════════════════════════════════════════════╣
     ║                                                             ║
     ║  Server läuft auf: http://localhost:{PORT}/                    ║
     ║                                                             ║
+    ║  Cache-Dauer: 5 Minuten                                   ║
     ║  Öffnen Sie diese URL in Ihrem Browser!                   ║
     ║  Drücken Sie Ctrl+C zum Beenden                           ║
     ║                                                             ║
