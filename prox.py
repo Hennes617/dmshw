@@ -45,7 +45,7 @@ class WeatherProxyHandler(BaseHTTPRequestHandler):
             else:
                 # Cache ist abgelaufen oder leer, neue Daten abrufen
                 print("↻ Neue Daten von API abrufen...")
-                with urllib.request.urlopen('https://dmshw.vanix.cloud/nodes') as response:
+                with urllib.request.urlopen('https://api.bolte.lol/nodes') as response:
                     data = response.read()
                 
                 # Im Cache speichern
