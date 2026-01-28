@@ -323,25 +323,48 @@ class WeatherProxyHandler(BaseHTTPRequestHandler):
             return R * c;
         }
         
-        function findNearestNode(userLat, userLon, nodes) {
-            let nearestNode = null;
-            let minDistance = Infinity;
+        function findBestMatchingNode(userLat, userLon, nodes, referenceTemp, tempTolerance = 2) {
+            const validNodes = nodes
+                .filter(node => node.latitude && node.longitude &&
+                    node.temperature !== null &&
+                    node.relative_humidity !== null &&
+                    node.barometric_pressure !== null)
+                .map(node => ({
+                    node,
+                    distance: calculateDistance(userLat, userLon, node.latitude, node.longitude),
+                    tempDiff: Math.abs(parseFloat(node.temperature) - referenceTemp)
+                }));
             
-            nodes.forEach(node => {
-                if (node.latitude && node.longitude && 
-                    node.temperature !== null && 
-                    node.relative_humidity !== null && 
-                    node.barometric_pressure !== null) {
-                    
-                    const distance = calculateDistance(userLat, userLon, node.latitude, node.longitude);
-                    if (distance < minDistance) {
-                        minDistance = distance;
-                        nearestNode = node;
-                    }
+            if (validNodes.length === 0) {
+                return { node: null, distance: Infinity };
+            }
+            
+            const matchingNodes = validNodes
+                .filter(item => item.tempDiff <= tempTolerance)
+                .sort((a, b) => a.distance - b.distance);
+            
+            if (matchingNodes.length > 0) {
+                return { node: matchingNodes[0].node, distance: matchingNodes[0].distance };
+            }
+            
+            const bestFallback = validNodes.sort((a, b) => {
+                if (a.tempDiff !== b.tempDiff) {
+                    return a.tempDiff - b.tempDiff;
                 }
-            });
+                return a.distance - b.distance;
+            })[0];
             
-            return { node: nearestNode, distance: minDistance };
+            return { node: bestFallback.node, distance: bestFallback.distance };
+        }
+
+        async function fetchOpenMeteoTemperature(lat, lon) {
+            const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m`;
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error('Open-Meteo Temperatur konnte nicht geladen werden');
+            }
+            const data = await response.json();
+            return data?.current?.temperature_2m;
         }
         
         function formatUpdateTime(dateString) {
@@ -401,25 +424,40 @@ class WeatherProxyHandler(BaseHTTPRequestHandler):
                 
                 const nodes = await response.json();
                 console.log(`${nodes.length} Nodes gefunden`);
+
+                let referenceTemp = null;
+                try {
+                    referenceTemp = await fetchOpenMeteoTemperature(userLat, userLon);
+                    console.log(`Open-Meteo Temperatur: ${referenceTemp}°C`);
+                } catch (openMeteoError) {
+                    console.warn('Open-Meteo Fehler, verwende nächste Station:', openMeteoError);
+                }
                 
-                const { node: nearestNode, distance } = findNearestNode(userLat, userLon, nodes);
+                let selectedNodeResult = null;
+                if (referenceTemp !== null && referenceTemp !== undefined) {
+                    selectedNodeResult = findBestMatchingNode(userLat, userLon, nodes, referenceTemp, 2);
+                } else {
+                    selectedNodeResult = findBestMatchingNode(userLat, userLon, nodes, 0, Infinity);
+                }
                 
-                if (!nearestNode) {
+                const { node: selectedNode, distance } = selectedNodeResult;
+                
+                if (!selectedNode) {
                     throw new Error('Keine Station mit gültigen Daten gefunden');
                 }
                 
                 document.getElementById('nodeName').textContent = 
-                    nearestNode.long_name || nearestNode.short_name || 'Unbekannt';
+                    selectedNode.long_name || selectedNode.short_name || 'Unbekannt';
                 document.getElementById('nodeDistance').textContent = 
                     `${distance.toFixed(1)} km entfernt`;
                 document.getElementById('temperature').textContent = 
-                    `${parseFloat(nearestNode.temperature).toFixed(1)}°C`;
+                    `${parseFloat(selectedNode.temperature).toFixed(1)}°C`;
                 document.getElementById('humidity').textContent = 
-                    `${parseFloat(nearestNode.relative_humidity).toFixed(1)}%`;
+                    `${parseFloat(selectedNode.relative_humidity).toFixed(1)}%`;
                 document.getElementById('pressure').textContent = 
-                    `${parseFloat(nearestNode.barometric_pressure).toFixed(1)} hPa`;
+                    `${parseFloat(selectedNode.barometric_pressure).toFixed(1)} hPa`;
                 document.getElementById('updateTime').textContent = 
-                    `Zuletzt aktualisiert: ${formatUpdateTime(nearestNode.updated_at)}`;
+                    `Zuletzt aktualisiert: ${formatUpdateTime(selectedNode.updated_at)}`;
                 
                 loadingEl.style.display = 'none';
                 weatherCard.classList.add('active');
