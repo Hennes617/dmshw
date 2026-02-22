@@ -20,45 +20,214 @@ cache = {
 
 CACHE_DURATION = 300  # 5 Minuten in Sekunden
 
+def calculate_distance(lat1, lon1, lat2, lon2):
+    """Berechnet die Distanz zwischen zwei Koordinaten in Kilometern."""
+    earth_radius = 6371
+    d_lat = radians(lat2 - lat1)
+    d_lon = radians(lon2 - lon1)
+    a = sin(d_lat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(d_lon / 2) ** 2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    return earth_radius * c
+
 class WeatherProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == '/':
+        parsed_url = urllib.parse.urlparse(self.path)
+        path = parsed_url.path
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+
+        if path == '/':
             self.serve_html()
-        elif self.path == '/nodes':
+        elif path == '/nodes':
             self.proxy_nodes()
+        elif path == '/api':
+            self.handle_api(query_params)
         else:
             self.send_error(404)
+
+    def send_json(self, payload, status=200, extra_headers=None):
+        """Sendet eine JSON-Antwort mit CORS-Headern."""
+        data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        if extra_headers:
+            for key, value in extra_headers.items():
+                self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def get_nodes_data(self):
+        """Lädt Node-Daten mit Cache und liefert (bytes, cache_status) zurück."""
+        global cache
+
+        current_time = time()
+        cache_age = current_time - cache['timestamp']
+        cache_is_valid = cache['data'] is not None and cache_age < CACHE_DURATION
+
+        if cache_is_valid:
+            print(f"✓ Cache verwendet (noch {int(CACHE_DURATION - cache_age)}s gültig)")
+            return cache['data'], 'HIT'
+
+        print("↻ Neue Daten von API abrufen...")
+        with urllib.request.urlopen('https://api.bolte.lol/nodes') as response:
+            data = response.read()
+        cache['data'] = data
+        cache['timestamp'] = current_time
+        print(f"✓ Daten gecached für {CACHE_DURATION}s")
+        return data, 'MISS'
+
+    def fetch_openmeteo_current(self, lat, lon):
+        """Lädt aktuelle Open-Meteo Daten für die angegebenen Koordinaten."""
+        url = (
+            "https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,surface_pressure"
+        )
+        with urllib.request.urlopen(url) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+        return payload.get('current', {})
+
+    def parse_coordinate(self, query_params, primary, fallback=None):
+        """Parst einen Koordinaten-Parameter als float."""
+        value = query_params.get(primary, [None])[0]
+        if value is None and fallback:
+            value = query_params.get(fallback, [None])[0]
+        if value is None:
+            return None
+        return float(value)
+
+    def find_nearest_node(self, user_lat, user_lon, nodes):
+        """Findet die nächste Node mit gültigen Koordinaten."""
+        nearest = None
+        min_distance = float('inf')
+
+        for node in nodes:
+            node_lat = node.get('latitude')
+            node_lon = node.get('longitude')
+            if node_lat is None or node_lon is None:
+                continue
+
+            distance = calculate_distance(user_lat, user_lon, float(node_lat), float(node_lon))
+            if distance < min_distance:
+                min_distance = distance
+                nearest = node
+
+        return nearest, min_distance
+
+    def find_best_matching_node(self, user_lat, user_lon, nodes, openmeteo_current):
+        """
+        Gleiche Logik wie auf der Hauptseite:
+        - Kandidaten mit gültigen Wetterdaten
+        - Wenn möglich Temperatur-Match zu Open-Meteo (<= 2°C) und dann kürzeste Distanz
+        - Sonst Fallback: kleinste Temperaturabweichung, dann Distanz
+        """
+        ref_temp = openmeteo_current.get('temperature_2m')
+        candidates = []
+        for node in nodes:
+            node_lat = node.get('latitude')
+            node_lon = node.get('longitude')
+            node_temp = node.get('temperature')
+            node_humidity = node.get('relative_humidity')
+            node_pressure = node.get('barometric_pressure')
+
+            if (
+                node_lat is None or node_lon is None or
+                node_temp is None or node_humidity is None or node_pressure is None
+            ):
+                continue
+
+            distance_km = calculate_distance(user_lat, user_lon, float(node_lat), float(node_lon))
+            temp_diff = abs(float(node_temp) - float(ref_temp)) if ref_temp is not None else 0.0
+
+            candidates.append({
+                'node': node,
+                'distance_km': distance_km,
+                'temp_diff': temp_diff,
+            })
+
+        if not candidates:
+            return None, None
+
+        if ref_temp is None:
+            best = sorted(candidates, key=lambda c: c['distance_km'])[0]
+            return best['node'], best
+
+        # Wie im Frontend: bei passenden Temperaturen die nächste Node wählen.
+        matching = [c for c in candidates if c['temp_diff'] <= 2]
+        if matching:
+            best = sorted(matching, key=lambda c: c['distance_km'])[0]
+            return best['node'], best
+
+        # Fallback wie im Frontend: kleinste Temperaturabweichung, dann Distanz.
+        best = sorted(candidates, key=lambda c: (c['temp_diff'], c['distance_km']))[0]
+        return best['node'], best
+
+    def handle_api(self, query_params):
+        """API: /api?lat=52.1&long=10.1 -> nächste Node + Open-Meteo Vergleich."""
+        try:
+            user_lat = self.parse_coordinate(query_params, 'lat')
+            user_lon = self.parse_coordinate(query_params, 'long', fallback='lon')
+        except ValueError:
+            self.send_json(
+                {'error': 'Ungültige Koordinaten. Bitte numerische Werte für lat und long verwenden.'},
+                status=400
+            )
+            return
+
+        if user_lat is None or user_lon is None:
+            self.send_json(
+                {'error': 'Fehlende Parameter. Beispiel: /api?lat=52.10&long=10.10'},
+                status=400
+            )
+            return
+
+        try:
+            raw_nodes, cache_status = self.get_nodes_data()
+            nodes = json.loads(raw_nodes.decode('utf-8'))
+            openmeteo_current = self.fetch_openmeteo_current(user_lat, user_lon)
+            selected_node, match_details = self.find_best_matching_node(user_lat, user_lon, nodes, openmeteo_current)
+
+            if not selected_node or not match_details:
+                # Fallback nur nach Distanz, falls keine Node komplette Werte hat
+                selected_node, distance_km = self.find_nearest_node(user_lat, user_lon, nodes)
+                if not selected_node:
+                    self.send_json({'error': 'Keine Node mit gültigen Koordinaten gefunden.'}, status=404)
+                    return
+                match_details = {
+                    'distance_km': distance_km,
+                    'temp_diff': None,
+                }
+
+            response_payload = {
+                'lat': user_lat,
+                'long': user_lon,
+                'node_name': selected_node.get('long_name') or selected_node.get('short_name') or 'Unbekannt',
+                'distance_km': round(match_details['distance_km'], 2),
+                'temperature': selected_node.get('temperature'),
+                'relative_humidity': selected_node.get('relative_humidity'),
+                'barometric_pressure': selected_node.get('barometric_pressure'),
+                'updated_at': selected_node.get('updated_at'),
+                'checked_with_openmeteo': True,
+                'check_diff': {
+                    'temperature': round(match_details['temp_diff'], 2) if match_details['temp_diff'] is not None else None,
+                }
+            }
+
+            self.send_json(response_payload, extra_headers={'X-Cache-Status': cache_status})
+
+        except Exception as e:
+            print(f"✗ Fehler /api: {e}")
+            self.send_json({'error': str(e)}, status=500)
     
     def proxy_nodes(self):
         """Leitet die Anfrage an die API weiter und gibt die Daten zurück (mit Cache)"""
-        global cache
-        
         try:
-            current_time = time()
-            cache_age = current_time - cache['timestamp']
-            
-            # Prüfe ob Cache gültig ist
-            if cache['data'] is not None and cache_age < CACHE_DURATION:
-                # Cache ist noch gültig
-                print(f"✓ Cache verwendet (noch {int(CACHE_DURATION - cache_age)}s gültig)")
-                data = cache['data']
-            else:
-                # Cache ist abgelaufen oder leer, neue Daten abrufen
-                print("↻ Neue Daten von API abrufen...")
-                with urllib.request.urlopen('https://api.bolte.lol/nodes') as response:
-                    data = response.read()
-                
-                # Im Cache speichern
-                cache['data'] = data
-                cache['timestamp'] = current_time
-                print(f"✓ Daten gecached für {CACHE_DURATION}s")
-            
+            data, cache_status = self.get_nodes_data()
+
             # Antwort mit CORS-Headern senden
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('X-Cache-Status', 
-                           'HIT' if cache_age < CACHE_DURATION else 'MISS')
+            self.send_header('X-Cache-Status', cache_status)
             self.end_headers()
             self.wfile.write(data)
             
@@ -405,8 +574,8 @@ class WeatherProxyHandler(BaseHTTPRequestHandler):
                 
                 console.log(`Standort: ${userLat}, ${userLon}`);
                 
-                // Daten vom lokalen Proxy abrufen
-                const response = await fetch('/nodes');
+                // Geprüfte Daten direkt über /api abrufen (gleiche Logik wie API)
+                const response = await fetch(`/api?lat=${encodeURIComponent(userLat)}&long=${encodeURIComponent(userLon)}`);
                 if (!response.ok) {
                     throw new Error('Fehler beim Abrufen der Daten');
                 }
@@ -422,42 +591,23 @@ class WeatherProxyHandler(BaseHTTPRequestHandler):
                     cacheStatusEl.style.color = '#667eea';
                 }
                 
-                const nodes = await response.json();
-                console.log(`${nodes.length} Nodes gefunden`);
-
-                let referenceTemp = null;
-                try {
-                    referenceTemp = await fetchOpenMeteoTemperature(userLat, userLon);
-                    console.log(`Open-Meteo Temperatur: ${referenceTemp}°C`);
-                } catch (openMeteoError) {
-                    console.warn('Open-Meteo Fehler, verwende nächste Station:', openMeteoError);
-                }
-                
-                let selectedNodeResult = null;
-                if (referenceTemp !== null && referenceTemp !== undefined) {
-                    selectedNodeResult = findBestMatchingNode(userLat, userLon, nodes, referenceTemp, 2);
-                } else {
-                    selectedNodeResult = findBestMatchingNode(userLat, userLon, nodes, 0, Infinity);
-                }
-                
-                const { node: selectedNode, distance } = selectedNodeResult;
-                
-                if (!selectedNode) {
+                const apiData = await response.json();
+                if (!apiData || !apiData.node_name) {
                     throw new Error('Keine Station mit gültigen Daten gefunden');
                 }
                 
                 document.getElementById('nodeName').textContent = 
-                    selectedNode.long_name || selectedNode.short_name || 'Unbekannt';
+                    apiData.node_name || 'Unbekannt';
                 document.getElementById('nodeDistance').textContent = 
-                    `${distance.toFixed(1)} km entfernt`;
+                    `${Number(apiData.distance_km).toFixed(1)} km entfernt`;
                 document.getElementById('temperature').textContent = 
-                    `${parseFloat(selectedNode.temperature).toFixed(1)}°C`;
+                    `${parseFloat(apiData.temperature).toFixed(1)}°C`;
                 document.getElementById('humidity').textContent = 
-                    `${parseFloat(selectedNode.relative_humidity).toFixed(1)}%`;
+                    `${parseFloat(apiData.relative_humidity).toFixed(1)}%`;
                 document.getElementById('pressure').textContent = 
-                    `${parseFloat(selectedNode.barometric_pressure).toFixed(1)} hPa`;
+                    `${parseFloat(apiData.barometric_pressure).toFixed(1)} hPa`;
                 document.getElementById('updateTime').textContent = 
-                    `Zuletzt aktualisiert: ${formatUpdateTime(selectedNode.updated_at)}`;
+                    `Zuletzt aktualisiert: ${formatUpdateTime(apiData.updated_at)}`;
                 
                 loadingEl.style.display = 'none';
                 weatherCard.classList.add('active');
